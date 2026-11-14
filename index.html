@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#f5f1ea">
+  <title>積読スワイプ｜新刊チェック</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-row">
+        <h1 class="brand">積読スワイプ <small>新刊チェック</small></h1>
+        <button type="button" class="saved-btn" id="btn-saved" aria-haspopup="dialog">
+          保存一覧 <span class="badge" id="saved-count">0</span>
+        </button>
+      </div>
+      <div class="progress-row">
+        <div class="progress" id="progress" aria-live="polite">読み込み中…</div>
+        <div class="bar" aria-hidden="true"><div class="bar-fill" id="bar-fill"></div></div>
+      </div>
+    </header>
+
+    <main class="deck" id="deck" aria-label="新刊カード">
+      <p class="deck-msg" id="deck-msg">データを読み込んでいます…</p>
+    </main>
+
+    <nav class="controls" aria-label="操作">
+      <button type="button" class="ctl ctl-undo" id="btn-undo" disabled aria-label="直前の操作を取り消す">
+        <span class="ctl-icon" aria-hidden="true">↶</span><span class="ctl-label">取り消し</span>
+      </button>
+      <button type="button" class="ctl ctl-skip" id="btn-skip" aria-label="スキップ（左スワイプ）">
+        <span class="ctl-icon" aria-hidden="true">✕</span><span class="ctl-label">スキップ</span>
+      </button>
+      <button type="button" class="ctl ctl-save" id="btn-save" aria-label="保存（右スワイプ）">
+        <span class="ctl-icon" aria-hidden="true">♥</span><span class="ctl-label">保存</span>
+      </button>
+    </nav>
+    <p class="hint">右スワイプ＝保存／左スワイプ＝スキップ<span class="kbd-hint">（キーボード: → 保存 / ← スキップ / Z 取り消し）</span></p>
+  </div>
+
+  <dialog id="saved-dialog" class="sheet" aria-labelledby="saved-title">
+    <div class="sheet-head">
+      <h2 id="saved-title">保存した本 <span id="saved-title-count">0</span>冊</h2>
+      <button type="button" class="close-btn" id="btn-close-saved" aria-label="閉じる">閉じる</button>
+    </div>
+    <div class="sheet-actions">
+      <button type="button" class="act" id="btn-export-csv">CSVダウンロード</button>
+      <button type="button" class="act" id="btn-export-json">JSONダウンロード</button>
+      <button type="button" class="act" id="btn-copy">クリップボードにコピー</button>
+      <span class="export-status" id="export-status" role="status"></span>
+    </div>
+    <ul class="saved-list" id="saved-list"></ul>
+    <p class="saved-empty" id="saved-empty">まだ保存した本はありません。右スワイプか「保存」ボタンで追加できます。</p>
+    <p class="credit" id="credit">書誌・書影: openBD／国立国会図書館サーチ／版元ドットコム</p>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
