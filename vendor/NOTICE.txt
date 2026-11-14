@@ -1,0 +1,4 @@
+同梱ライブラリ（外部CDNは使っていません）
+
+- qrcode.js : qrcode-generator 2.0.4 (npm) — Copyright (c) 2009 Kazuhiko Arase — MIT License（ファイル先頭に記載）
+- jsQR.js   : jsqr 1.4.0 (npm) — Apache License 2.0（LICENSE-jsQR.txt）

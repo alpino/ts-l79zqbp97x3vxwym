@@ -12,6 +12,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   font-family: system-ui, -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", sans-serif;
@@ -41,6 +42,27 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .progress b { color: var(--text); font-size: .95rem; }
 .bar { flex: 1; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
 .bar-fill { height: 100%; width: 0; background: var(--accent); transition: width .25s ease; }
+.topbar-actions { display: flex; align-items: center; gap: 6px; }
+.sync-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1.5px solid var(--line);
+  color: var(--muted);
+  background: #fff;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: .8rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.sync-dot { width: 8px; height: 8px; border-radius: 50%; background: #b9b2a6; flex: 0 0 auto; }
+.sync-btn[data-state="ok"] .sync-dot { background: var(--save); }
+.sync-btn[data-state="busy"] .sync-dot { background: #c98a00; }
+.sync-btn[data-state="error"] .sync-dot { background: var(--skip); }
+.sync-line { margin: 3px 0 0; font-size: .7rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sync-line.is-error { color: var(--skip); white-space: normal; }
+@media (max-width: 380px) { .brand small { display: none; } }
 .saved-btn {
   border: 1.5px solid var(--accent);
   color: var(--accent);
@@ -223,7 +245,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .ctl-undo { width: 58px; height: 58px; color: var(--undo); }
 .ctl:disabled { opacity: .4; cursor: default; }
 .ctl:not(:disabled):active { transform: scale(.94); }
-.ctl:focus-visible, .saved-btn:focus-visible, .act:focus-visible, .more-btn:focus-visible { outline: 3px solid #f2b705; outline-offset: 2px; }
+.ctl:focus-visible, .saved-btn:focus-visible, .sync-btn:focus-visible, .act:focus-visible, .more-btn:focus-visible { outline: 3px solid #f2b705; outline-offset: 2px; }
 
 .hint { margin: 2px 0 calc(8px + env(safe-area-inset-bottom)); text-align: center; font-size: .72rem; color: var(--muted); }
 .kbd-hint { display: none; }
@@ -270,6 +292,48 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .remove-btn { flex: 0 0 auto; border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 4px 8px; font-size: .75rem; color: var(--skip); }
 .saved-empty { padding: 24px 16px; color: var(--muted); text-align: center; }
 .credit { margin: 0; padding: 8px 16px calc(10px + env(safe-area-inset-bottom)); font-size: .7rem; color: var(--muted); border-top: 1px solid var(--line); }
+
+/* ---------- sync dialog */
+@media (min-width: 601px) { .sync-sheet { height: fit-content; max-height: min(92dvh, 900px); } }
+.sync-body {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 16px calc(16px + env(safe-area-inset-bottom));
+  font-size: .88rem;
+  line-height: 1.6;
+}
+.sync-body p { margin: 0; }
+.sync-intro { color: var(--muted); }
+.sync-state { padding: 8px 10px; background: #f7f4ee; border-radius: 8px; overflow-wrap: anywhere; }
+.sync-state.is-error { color: var(--skip); }
+.sync-form label { display: block; margin: 6px 0 4px; font-size: .82rem; font-weight: 700; }
+.sync-form input {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  border: 1.5px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 16px;
+  color: var(--text);
+  background: #fff;
+}
+.sync-form input:focus-visible { outline: 3px solid #f2b705; outline-offset: 1px; }
+.sync-form input.secret { -webkit-text-security: disc; }
+.sync-form .sync-actions { margin-top: 12px; }
+.sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.act-quiet { background: #fff; color: var(--accent); }
+.act-danger { background: #fff; color: var(--skip); border-color: var(--skip); }
+.sync-msg { margin-top: 8px !important; font-size: .8rem; color: var(--skip); }
+.sync-msg:empty { display: none; }
+.qr-box, .scan-box { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; }
+.qr-box canvas { width: min(300px, 80vw); height: auto; image-rendering: pixelated; background: #fff; border: 1px solid var(--line); }
+.warn { color: var(--skip); font-weight: 700; font-size: .82rem; }
+.qr-howto { font-size: .8rem; color: var(--muted); }
+.scan-box video { width: min(320px, 86vw); aspect-ratio: 1; object-fit: cover; background: #000; border-radius: 8px; }
 
 /* ---------- toast */
 .toast {

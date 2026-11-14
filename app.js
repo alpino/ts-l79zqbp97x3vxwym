@@ -3,6 +3,10 @@
   'use strict';
 
   const STORE_KEY = 'tsundoku-swipe:v1';
+  const SYNC_KEY = 'tsundoku-swipe:sync';       // 同期設定（この端末のブラウザにだけ保存）
+  const SYNC_FILE = 'records.json';
+  const SYNC_DEBOUNCE_MS = 2000;                // 変更をまとめて書き込むまでの待ち時間
+  const QR_PREFIX = 'tsundoku-swipe-sync:1:';
   const $ = (sel) => document.querySelector(sel);
 
   const el = {
@@ -25,6 +29,29 @@
     exportStatus: $('#export-status'),
     toast: $('#toast'),
     credit: $('#credit'),
+    btnSync: $('#btn-sync'),
+    syncLine: $('#sync-line'),
+    syncDialog: $('#sync-dialog'),
+    btnCloseSync: $('#btn-close-sync'),
+    syncState: $('#sync-state'),
+    syncOnActions: $('#sync-on-actions'),
+    btnSyncNow: $('#btn-sync-now'),
+    btnShowQr: $('#btn-show-qr'),
+    btnSyncEdit: $('#btn-sync-edit'),
+    btnSyncOff: $('#btn-sync-off'),
+    qrBox: $('#qr-box'),
+    qrCanvas: $('#qr-canvas'),
+    btnHideQr: $('#btn-hide-qr'),
+    syncForm: $('#sync-form'),
+    syncRepo: $('#sync-repo'),
+    syncToken: $('#sync-token'),
+    btnSyncSave: $('#btn-sync-save'),
+    btnScan: $('#btn-scan'),
+    syncFormMsg: $('#sync-form-msg'),
+    scanBox: $('#scan-box'),
+    scanVideo: $('#scan-video'),
+    scanMsg: $('#scan-msg'),
+    btnScanStop: $('#btn-scan-stop'),
   };
 
   const state = {
@@ -32,6 +59,7 @@
     generatedAt: '',
     decisions: {},  // isbn -> 'save' | 'skip'
     saved: [],      // 保存順のスナップショット
+    stamps: {},     // isbn -> 最後に変更した時刻(ms)。端末間のマージで「新しい方」を決める
     last: null,     // 直近1回分 { isbn, action, addedToSaved }
     busy: false,
   };
@@ -43,14 +71,24 @@
       if (raw && typeof raw === 'object') {
         state.decisions = raw.decisions || {};
         state.saved = Array.isArray(raw.saved) ? raw.saved : [];
+        state.stamps = raw.stamps && typeof raw.stamps === 'object' ? raw.stamps : {};
         state.last = raw.last || null;
       }
     } catch (_) { /* 壊れていたら初期状態から */ }
   }
   function persist() {
     localStorage.setItem(STORE_KEY, JSON.stringify({
-      version: 1, decisions: state.decisions, saved: state.saved, last: state.last,
+      version: 1, decisions: state.decisions, saved: state.saved, last: state.last, stamps: state.stamps,
     }));
+  }
+  // 本ごとの変更時刻を進める（端末の時計が多少ずれていても、その本の直前の記録より必ず新しくする）
+  function touch(isbn) {
+    state.stamps[isbn] = Math.max(Date.now(), (Number(state.stamps[isbn]) || 0) + 1);
+  }
+  // ローカルで記録を変えた時：保存して、同期が有効なら少し待ってから書き込む
+  function changed() {
+    persist();
+    scheduleSync();
   }
 
   // ------------------------------------------------------------ helpers
@@ -212,9 +250,11 @@
     const again = textEl('button', 'act', 'スキップした本をもう一度見る');
     again.type = 'button';
     again.addEventListener('click', () => {
-      for (const [isbn, act] of Object.entries(state.decisions)) if (act === 'skip') delete state.decisions[isbn];
+      for (const [isbn, act] of Object.entries(state.decisions)) {
+        if (act === 'skip') { delete state.decisions[isbn]; touch(isbn); }
+      }
       state.last = null;
-      persist();
+      changed();
       render('advance');
     });
     box.append(openBtn, again);
@@ -256,7 +296,8 @@
       addedToSaved = true;
     }
     state.last = { isbn: book.isbn, action, addedToSaved };
-    persist();
+    touch(book.isbn);
+    changed();
     el.savedCount.textContent = String(state.saved.length);
     toast(action === 'save' ? `保存しました：${book.title}` : `スキップ：${book.title}`);
 
@@ -292,7 +333,8 @@
       state.saved = state.saved.filter((s) => s.isbn !== isbn);
     }
     state.last = null; // 取り消しは直近1回分のみ
-    persist();
+    touch(isbn);
+    changed();
     const book = state.books.find((b) => b.isbn === isbn);
     toast(`取り消しました：${book ? book.title : isbn}`);
     render('undo');
@@ -388,7 +430,8 @@
       rm.addEventListener('click', () => {
         state.saved = state.saved.filter((s) => s.isbn !== b.isbn);
         if (state.last && state.last.isbn === b.isbn) state.last = null;
-        persist();
+        touch(b.isbn);
+        changed();
         renderSaved();
         render();
       });
@@ -474,6 +517,497 @@
       : 'コピーできませんでした。CSVダウンロードをお使いください';
   }
 
+
+  // ------------------------------------------------------------ sync (GitHub 非公開リポジトリの records.json)
+  // 設定が無ければ何もしない（今まで通りこの端末だけで動く）。
+  // 記録は本ごとに { t: 変更時刻ms, d: 'save'|'skip'（無ければ未判定）, s: 保存一覧の項目（無ければ一覧に無い） }。
+  // d も s も無い記録は「取り消した／一覧から消した」印（他端末で復活しないように残す）。
+  const SAVED_FIELDS = ['title', 'author', 'publisher', 'pubdate', 'cover', 'source', 'source_url', 'savedAt'];
+  const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
+
+  const sync = {
+    cfg: null,          // { repo: 'owner/name', token }
+    sha: null,          // 最後に読み書きした records.json の SHA
+    remoteCanon: null,  // その時のリモートの中身（比較用）
+    timer: 0,
+    running: false,
+    want: null,         // 'pull' | 'push'
+    error: null,
+    lastOk: 0,
+    lastPull: 0,
+  };
+
+  class SyncError extends Error {
+    constructor(message, kind) { super(message); this.kind = kind; }
+  }
+
+  function cleanSaved(src, isbn) {
+    const o = { isbn };
+    for (const k of SAVED_FIELDS) if (src[k] != null && src[k] !== '') o[k] = String(src[k]);
+    return o;
+  }
+  function normRecord(r, isbn) {
+    if (!r || typeof r !== 'object') return null;
+    const t = Number(r.t);
+    const out = { t: Number.isFinite(t) && t > 0 ? Math.floor(t) : 0 };
+    if (r.d === 'save' || r.d === 'skip') out.d = r.d;
+    if (r.s && typeof r.s === 'object') out.s = cleanSaved(r.s, isbn);
+    return out;
+  }
+  function localRecords() {
+    const recs = {};
+    const savedBy = new Map(state.saved.map((s) => [s.isbn, s]));
+    const keys = new Set([...Object.keys(state.decisions), ...savedBy.keys(), ...Object.keys(state.stamps)]);
+    for (const isbn of keys) {
+      const s = savedBy.get(isbn);
+      // 同期機能より前の記録には時刻が無いので、保存日時（無ければ 0＝いちばん古い）を使う
+      const t = state.stamps[isbn] != null ? state.stamps[isbn] : (s && Date.parse(s.savedAt)) || 0;
+      recs[isbn] = normRecord({ t, d: state.decisions[isbn], s }, isbn);
+    }
+    return recs;
+  }
+  function sortedObj(o) {
+    const out = {};
+    for (const k of Object.keys(o).sort()) out[k] = o[k];
+    return out;
+  }
+  function canon(recs) { return JSON.stringify(sortedObj(recs)); }
+  function strength(r) { return r.s ? 2 : r.d === 'save' ? 1 : 0; }
+  // 本ごとに新しい方を採る。時刻が同じなら「保存」を残す側に倒し、最後は中身で決める（どの端末でも同じ結果になる）
+  function newer(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a.t !== b.t) return a.t > b.t ? a : b;
+    if (strength(a) !== strength(b)) return strength(a) > strength(b) ? a : b;
+    return JSON.stringify(a) >= JSON.stringify(b) ? a : b;
+  }
+  function mergeRecords(local, remote) {
+    const out = {};
+    for (const k of new Set([...Object.keys(local), ...Object.keys(remote)])) out[k] = newer(local[k], remote[k]);
+    return out;
+  }
+  // マージ結果を画面の状態に反映。ローカルが変わったら true
+  function applyRecords(recs) {
+    const before = localRecords();
+    if (canon(before) === canon(recs)) return false;
+    const decisions = {};
+    const stamps = {};
+    const saved = [];
+    for (const [isbn, r] of Object.entries(recs)) {
+      stamps[isbn] = r.t;
+      if (r.d) decisions[isbn] = r.d;
+      if (r.s) saved.push(r.s);
+    }
+    saved.sort((x, y) => String(x.savedAt || '').localeCompare(String(y.savedAt || '')));
+    if (state.last && JSON.stringify(before[state.last.isbn]) !== JSON.stringify(recs[state.last.isbn])) {
+      state.last = null; // 他の端末で変わった本は「取り消し」の対象から外す
+    }
+    state.decisions = decisions;
+    state.stamps = stamps;
+    state.saved = saved;
+    persist();
+    return true;
+  }
+  function onRemoteApplied() {
+    if (document.body.dataset.ready === '1' && !state.busy) render();
+    else el.savedCount.textContent = String(state.saved.length);
+    if (el.dialog.open) renderSaved();
+    toast('ほかの端末の記録を反映しました');
+  }
+
+  function b64encode(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  }
+  function b64decode(b64) {
+    const bin = atob(String(b64).replace(/\s/g, ''));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function api(cfg, method, body) {
+    const [owner, name] = cfg.repo.split('/');
+    const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/contents/${SYNC_FILE}`;
+    const headers = {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    };
+    if (body) headers['Content-Type'] = 'application/json';
+    try {
+      return await fetch(url, { method, headers, cache: 'no-store', body: body ? JSON.stringify(body) : undefined });
+    } catch (_) {
+      throw new SyncError('通信できませんでした（オフラインかもしれません）', 'network');
+    }
+  }
+  function httpError(res) {
+    if (res.status === 401) return new SyncError('トークンが無効か、期限切れです', 'auth');
+    if (res.status === 429 || (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0')) {
+      return new SyncError('GitHub の利用回数の上限に達しました。しばらくしてから「今すぐ同期」を押してください', 'rate');
+    }
+    if (res.status === 403) return new SyncError('トークンに書き込みの権限がありません（Contents の書き込みが必要です）', 'perm');
+    if (res.status === 404) return new SyncError('リポジトリが見つかりません（リポジトリ名と、トークンの対象リポジトリを確認してください）', 'notfound');
+    return new SyncError(`GitHub の応答エラー（HTTP ${res.status}）`, 'http');
+  }
+  async function pullRemote(cfg) {
+    const res = await api(cfg, 'GET');
+    if (res.status === 404) {
+      // ファイルが無い（またはリポジトリに届かない）。書き込みの応答で判定する
+      sync.sha = null;
+      sync.remoteCanon = null;
+      return {};
+    }
+    if (!res.ok) throw httpError(res);
+    const meta = await res.json();
+    const recs = {};
+    try {
+      const data = JSON.parse(b64decode(meta.content || ''));
+      const books = data && data.books && typeof data.books === 'object' ? data.books : {};
+      for (const [isbn, r] of Object.entries(books)) {
+        const n = normRecord(r, isbn);
+        if (n) recs[isbn] = n;
+      }
+    } catch (_) {
+      throw new SyncError('リポジトリの記録ファイルを読めませんでした（中身が壊れているかもしれません）', 'parse');
+    }
+    sync.sha = meta.sha || null;
+    sync.remoteCanon = canon(recs);
+    return recs;
+  }
+  // 書けたら true、SHA 不一致（他の端末が先に書いた）なら false
+  async function pushRemote(cfg, recs) {
+    const text = JSON.stringify({
+      app: 'tsundoku-swipe', version: 1, updatedAt: new Date().toISOString(), books: sortedObj(recs),
+    }, null, 1);
+    const body = { message: 'update records', content: b64encode(text + '\n') };
+    if (sync.sha) body.sha = sync.sha;
+    const res = await api(cfg, 'PUT', body);
+    if (res.status === 409 || res.status === 422) return false;
+    if (!res.ok) throw httpError(res);
+    const out = await res.json();
+    sync.sha = (out.content && out.content.sha) || null;
+    sync.remoteCanon = canon(recs);
+    return true;
+  }
+  async function syncOnce(cfg, mode) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) await sleep(500 * attempt);
+      if (mode === 'pull' || attempt > 0 || sync.remoteCanon === null) {
+        const remote = await pullRemote(cfg);
+        if (mode === 'pull') sync.lastPull = Date.now();
+        if (applyRecords(mergeRecords(localRecords(), remote))) onRemoteApplied();
+      }
+      const local = localRecords();
+      if (canon(local) === sync.remoteCanon) return;
+      if (await pushRemote(cfg, local)) return;
+      // SHA 不一致：次の周回で取り直して再マージ
+    }
+    throw new SyncError('ほかの端末の書き込みと重なり、書き込めませんでした。少しあとで「今すぐ同期」を押してください', 'conflict');
+  }
+
+  function requestSync(mode) {
+    if (!sync.cfg) return;
+    if (mode === 'pull' || !sync.want) sync.want = mode;
+    clearTimeout(sync.timer);
+    sync.timer = 0;
+    if (!sync.running) runSync();
+    else renderSyncStatus();
+  }
+  async function runSync() {
+    sync.running = true;
+    renderSyncStatus();
+    while (sync.want && sync.cfg) {
+      const mode = sync.want;
+      const cfg = sync.cfg;
+      sync.want = null;
+      try {
+        await syncOnce(cfg, mode);
+        sync.error = null;
+        sync.lastOk = Date.now();
+      } catch (err) {
+        sync.error = err instanceof SyncError ? err : new SyncError(`同期できませんでした（${err && err.message}）`, 'unknown');
+        break; // 記録はローカルに残っている。次の変更・画面の再表示・「今すぐ同期」で再試行
+      }
+    }
+    sync.running = false;
+    renderSyncStatus();
+  }
+  function scheduleSync() {
+    if (!sync.cfg) return;
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(() => requestSync('push'), SYNC_DEBOUNCE_MS);
+    renderSyncStatus();
+  }
+
+  // ---- 設定の保存（localStorage のこのキーだけ。コードやリポジトリには入れない）
+  function loadSyncCfg() {
+    try {
+      const c = JSON.parse(localStorage.getItem(SYNC_KEY) || 'null');
+      if (c && typeof c.repo === 'string' && typeof c.token === 'string' && c.repo && c.token) {
+        return { repo: c.repo, token: c.token };
+      }
+    } catch (_) { /* 壊れていたら未設定扱い */ }
+    return null;
+  }
+  function setSyncCfg(cfg) {
+    if (cfg) localStorage.setItem(SYNC_KEY, JSON.stringify({ v: 1, repo: cfg.repo, token: cfg.token }));
+    else localStorage.removeItem(SYNC_KEY);
+    sync.cfg = cfg;
+    sync.sha = null;
+    sync.remoteCanon = null;
+    sync.error = null;
+    sync.lastOk = 0;
+    sync.want = null;
+    clearTimeout(sync.timer);
+    sync.timer = 0;
+  }
+  function normalizeRepo(v) {
+    const r = String(v || '').trim()
+      .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+      .replace(/\.git$/i, '')
+      .replace(/\/+$/, '');
+    return /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(r) ? r : '';
+  }
+
+  // ---- 表示
+  function fmtClock(ms) {
+    const d = new Date(ms);
+    return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  function syncStatusText() {
+    if (!sync.cfg) return '';
+    if (sync.running) return '同期中…';
+    if (sync.timer) return '同期待ち…';
+    if (sync.error) return `同期できませんでした：${sync.error.message}。記録はこの端末に残っています`;
+    if (sync.lastOk) return `同期済み ${fmtClock(sync.lastOk)}`;
+    return '同期の準備中…';
+  }
+  function renderSyncStatus() {
+    const on = !!sync.cfg;
+    const isErr = on && !sync.running && !sync.timer && !!sync.error;
+    el.btnSync.dataset.state = !on ? 'off' : (sync.running || sync.timer) ? 'busy' : isErr ? 'error' : sync.lastOk ? 'ok' : 'busy';
+    el.btnSync.setAttribute('aria-label', on ? `端末間の同期：${syncStatusText()}` : '端末間の同期：未設定');
+    el.syncLine.hidden = !on;
+    el.syncLine.textContent = syncStatusText();
+    el.syncLine.classList.toggle('is-error', isErr);
+    if (el.syncDialog.open) renderSyncDialog();
+  }
+  const syncUi = { editing: false, qrTimer: 0, scanSession: 0, stream: null, scanTimer: 0, scanCanvas: null };
+  function renderSyncDialog() {
+    const cfg = sync.cfg;
+    el.syncState.textContent = '';
+    if (!cfg) {
+      el.syncState.append('この端末では未設定です。記録はこの端末だけに保存されます。');
+    } else {
+      el.syncState.append(`設定済み：${cfg.repo}（トークン末尾 …${cfg.token.slice(-4)}）`, document.createElement('br'), syncStatusText());
+    }
+    el.syncState.classList.toggle('is-error', !!cfg && !sync.running && !sync.timer && !!sync.error);
+    el.syncOnActions.hidden = !cfg;
+    el.syncForm.hidden = !!cfg && !syncUi.editing;
+    el.btnShowQr.disabled = !cfg;
+  }
+  function openSync() {
+    syncUi.editing = false;
+    el.syncFormMsg.textContent = '';
+    el.syncToken.value = '';
+    el.syncRepo.value = sync.cfg ? sync.cfg.repo : '';
+    renderSyncDialog();
+    if (typeof el.syncDialog.showModal === 'function') el.syncDialog.showModal();
+    else el.syncDialog.setAttribute('open', '');
+  }
+  function closeSync() {
+    if (typeof el.syncDialog.close === 'function') el.syncDialog.close();
+    else el.syncDialog.removeAttribute('open');
+  }
+  function onSyncDialogClosed() {
+    stopScan();
+    hideQr();
+    el.syncToken.value = '';
+    syncUi.editing = false;
+  }
+  function applySyncCfg(cfg) {
+    setSyncCfg(cfg);
+    el.syncToken.value = '';
+    el.syncFormMsg.textContent = '';
+    syncUi.editing = false;
+    requestSync('pull');
+    renderSyncStatus();
+    renderSyncDialog();
+  }
+  function onSyncSave() {
+    const repo = normalizeRepo(el.syncRepo.value);
+    const token = el.syncToken.value.trim() || (sync.cfg ? sync.cfg.token : '');
+    if (!repo) { el.syncFormMsg.textContent = 'リポジトリは「持ち主/名前」の形で入れてください（例：alpino/xxxx）'; return; }
+    if (!TOKEN_RE.test(token)) { el.syncFormMsg.textContent = 'トークンの形が正しくありません。コピーし直して貼り付けてください'; return; }
+    applySyncCfg({ repo, token });
+  }
+  function onSyncOff() {
+    if (!window.confirm('この端末の同期を解除し、トークンをこのブラウザから消します。記録はこの端末に残ります。よろしいですか？')) return;
+    hideQr();
+    setSyncCfg(null);
+    renderSyncStatus();
+    renderSyncDialog();
+    toast('この端末の同期を解除しました');
+  }
+
+  // ---- QR（同梱の vendor/qrcode.js・vendor/jsQR.js を必要な時だけ読み込む）
+  function loadScript(src, ready) {
+    if (ready()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => (ready() ? resolve() : reject(new Error(`${src} を読み込めませんでした`)));
+      s.onerror = () => reject(new Error(`${src} を読み込めませんでした`));
+      document.head.append(s);
+    });
+  }
+  async function showQr() {
+    if (!sync.cfg) return;
+    try {
+      await loadScript('vendor/qrcode.js', () => typeof window.qrcode === 'function');
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+    const qr = window.qrcode(0, 'M');
+    qr.addData(`${QR_PREFIX}${sync.cfg.repo}:${sync.cfg.token}`, 'Byte');
+    qr.make();
+    const n = qr.getModuleCount();
+    const quiet = 4;
+    const scale = 8;
+    const size = (n + quiet * 2) * scale;
+    const c = el.qrCanvas;
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000';
+    for (let r = 0; r < n; r++) {
+      for (let col = 0; col < n; col++) {
+        if (qr.isDark(r, col)) ctx.fillRect((col + quiet) * scale, (r + quiet) * scale, scale, scale);
+      }
+    }
+    el.qrBox.hidden = false;
+    el.qrBox.scrollIntoView({ block: 'nearest' });
+    clearTimeout(syncUi.qrTimer);
+    syncUi.qrTimer = setTimeout(hideQr, 120000);
+  }
+  function hideQr() {
+    clearTimeout(syncUi.qrTimer);
+    const c = el.qrCanvas;
+    if (c.width) c.getContext('2d').clearRect(0, 0, c.width, c.height);
+    c.width = 0;
+    c.height = 0;
+    el.qrBox.hidden = true;
+  }
+  function parseQr(text) {
+    if (typeof text !== 'string' || !text.startsWith(QR_PREFIX)) return null;
+    const rest = text.slice(QR_PREFIX.length);
+    const i = rest.lastIndexOf(':');
+    if (i < 0) return null;
+    const repo = normalizeRepo(rest.slice(0, i));
+    const token = rest.slice(i + 1);
+    return repo && TOKEN_RE.test(token) ? { repo, token } : null;
+  }
+  async function startScan() {
+    stopScan();
+    const session = ++syncUi.scanSession;
+    el.scanBox.hidden = false;
+    el.scanMsg.textContent = 'カメラを起動しています…';
+    el.scanBox.scrollIntoView({ block: 'nearest' });
+    let stream;
+    try {
+      await loadScript('vendor/jsQR.js', () => typeof window.jsQR === 'function');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('no camera');
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    } catch (_) {
+      if (session === syncUi.scanSession) {
+        el.scanMsg.textContent = 'カメラを使えませんでした。カメラの許可を確認するか、トークンを貼り付けてください';
+      }
+      return;
+    }
+    if (session !== syncUi.scanSession) { stream.getTracks().forEach((t) => t.stop()); return; }
+    syncUi.stream = stream;
+    el.scanVideo.srcObject = stream;
+    const playing = el.scanVideo.play();
+    if (playing) playing.catch(() => { /* autoplay 属性で再生される */ });
+    el.scanMsg.textContent = 'QRをカメラに映してください';
+    syncUi.scanCanvas = syncUi.scanCanvas || document.createElement('canvas');
+    const tick = () => {
+      if (session !== syncUi.scanSession || !syncUi.stream) return;
+      const v = el.scanVideo;
+      if (v.readyState >= 2 && v.videoWidth) {
+        const k = Math.min(1, 720 / Math.max(v.videoWidth, v.videoHeight));
+        const w = Math.round(v.videoWidth * k);
+        const h = Math.round(v.videoHeight * k);
+        const cv = syncUi.scanCanvas;
+        cv.width = w;
+        cv.height = h;
+        const ctx = cv.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(v, 0, 0, w, h);
+        const code = window.jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'attemptBoth' });
+        if (code && code.data) {
+          const cfg = parseQr(code.data);
+          if (cfg) {
+            stopScan();
+            applySyncCfg(cfg);
+            toast('QRを読み取り、同期を設定しました');
+            return;
+          }
+          el.scanMsg.textContent = 'このサイトの同期用のQRではありません';
+        }
+      }
+      syncUi.scanTimer = setTimeout(tick, 200);
+    };
+    tick();
+  }
+  function stopScan() {
+    syncUi.scanSession++;
+    clearTimeout(syncUi.scanTimer);
+    if (syncUi.stream) syncUi.stream.getTracks().forEach((t) => t.stop());
+    syncUi.stream = null;
+    el.scanVideo.srcObject = null;
+    el.scanBox.hidden = true;
+  }
+
+  el.btnSync.addEventListener('click', openSync);
+  el.btnCloseSync.addEventListener('click', closeSync);
+  el.syncDialog.addEventListener('close', onSyncDialogClosed);
+  el.syncDialog.addEventListener('click', (e) => { if (e.target === el.syncDialog) closeSync(); });
+  el.btnSyncSave.addEventListener('click', onSyncSave);
+  for (const inp of [el.syncRepo, el.syncToken]) {
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); onSyncSave(); } });
+  }
+  el.btnSyncNow.addEventListener('click', () => requestSync('pull'));
+  el.btnShowQr.addEventListener('click', showQr);
+  el.btnHideQr.addEventListener('click', hideQr);
+  el.btnSyncEdit.addEventListener('click', () => {
+    syncUi.editing = true;
+    el.syncRepo.value = sync.cfg ? sync.cfg.repo : '';
+    el.syncToken.value = '';
+    el.syncToken.placeholder = sync.cfg ? '変えない時は空欄のまま' : 'github_pat_…';
+    renderSyncDialog();
+  });
+  el.btnSyncOff.addEventListener('click', onSyncOff);
+  el.btnScan.addEventListener('click', startScan);
+  el.btnScanStop.addEventListener('click', stopScan);
+
+  // 画面に戻った時に取り直す／離れる時は待たずに書き込む／回線が戻ったら再試行
+  document.addEventListener('visibilitychange', () => {
+    if (!sync.cfg) return;
+    if (document.visibilityState === 'hidden') {
+      if (sync.timer) requestSync('push');
+    } else if (Date.now() - sync.lastPull > 5000) {
+      requestSync('pull');
+    }
+  });
+  window.addEventListener('online', () => requestSync('pull'));
+
   // ------------------------------------------------------------ wiring
   el.btnSave.addEventListener('click', () => decide('save'));
   el.btnSkip.addEventListener('click', () => decide('skip'));
@@ -486,7 +1020,7 @@
   el.dialog.addEventListener('click', (e) => { if (e.target === el.dialog) closeSaved(); });
 
   document.addEventListener('keydown', (e) => {
-    if (el.dialog.open || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (el.dialog.open || el.syncDialog.open || e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key === 'ArrowRight') { e.preventDefault(); decide('save'); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); decide('skip'); }
     else if (e.key === 'z' || e.key === 'Z' || e.key === 'Backspace') { e.preventDefault(); undo(); }
@@ -495,6 +1029,8 @@
   // ------------------------------------------------------------ boot
   async function boot() {
     loadStore();
+    sync.cfg = loadSyncCfg();
+    renderSyncStatus();
     try {
       const res = await fetch('books.json', { cache: 'no-cache' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -512,6 +1048,7 @@
     }
     document.body.dataset.ready = '1';
     render();
+    if (sync.cfg) requestSync('pull');
   }
   boot();
 })();
