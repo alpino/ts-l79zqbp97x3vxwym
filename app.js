@@ -6,6 +6,9 @@
   const SYNC_KEY = 'tsundoku-swipe:sync';       // 同期設定（この端末のブラウザにだけ保存）
   const SYNC_FILE = 'records.json';
   const SYNC_DEBOUNCE_MS = 2000;                // 変更をまとめて書き込むまでの待ち時間
+  const SYNC_POLL_MS = 30000;                   // 画面の表示中、ほかの端末の変更を取り込む間隔
+  const SYNC_POLL_MAX_MS = 5 * 60 * 1000;       // 通信に失敗し続けた時に延ばす間隔の上限
+  const SYNC_TIMEOUT_MS = 20000;                // GitHub の応答を待つ上限（固まった通信で同期が止まらないように）
   const QR_PREFIX = 'tsundoku-swipe-sync:1:';
   const $ = (sel) => document.querySelector(sel);
 
@@ -60,8 +63,11 @@
     decisions: {},  // isbn -> 'save' | 'skip'
     saved: [],      // 保存順のスナップショット
     stamps: {},     // isbn -> 最後に変更した時刻(ms)。端末間のマージで「新しい方」を決める
-    last: null,     // 直近1回分 { isbn, action, addedToSaved }
+    last: null,     // 直近1回分 { isbn, action, addedToSaved, prevDecision, prevSaved }（前の2つは取り消しで元に戻す用）
     busy: false,
+    dragging: false,   // カードに指（マウス）が触れている間
+    deckStale: false,  // 触れている間に他端末の記録を取り込み、カードの描き直しを後回しにした
+    animUntil: 0,      // カードの出入り・戻りのアニメーションが終わる時刻（performance.now 基準）
   };
 
   // ------------------------------------------------------------ storage
@@ -207,28 +213,38 @@
     return card;
   }
 
+  function nextIndexAfter(idx) {
+    return state.books.findIndex((b, i) => i > idx && !state.decisions[b.isbn]);
+  }
+
   function render(mode) {
+    state.dragging = false; // 触れていたカードは作り直すので、その操作は終わり
+    state.deckStale = false;
     el.deck.textContent = '';
     const idx = currentIndex();
-    const total = state.books.length;
-    const done = decidedCount();
-
     if (idx === -1) {
-      el.progress.innerHTML = '';
-      el.progress.append('全', textEl('b', '', String(total)), '冊チェック完了');
       renderDone();
     } else {
-      el.progress.innerHTML = '';
-      el.progress.append(textEl('b', '', String(done + 1)), ` / ${total}冊目・残り${total - done}冊`);
-      const nextIdx = state.books.findIndex((b, i) => i > idx && !state.decisions[b.isbn]);
+      const nextIdx = nextIndexAfter(idx);
       if (nextIdx !== -1) el.deck.append(buildCard(state.books[nextIdx], 'next'));
       const card = buildCard(state.books[idx], 'current');
       if (mode === 'undo') card.classList.add('undo-enter');
       else if (mode === 'advance') card.classList.add('enter');
+      if (mode === 'undo' || mode === 'advance') state.animUntil = performance.now() + 300;
       el.deck.append(card);
       attachDrag(card);
       preload(idx);
     }
+    renderMeta(idx);
+  }
+
+  // 進み具合・ボタン・保存数（カードには触れない）
+  function renderMeta(idx) {
+    const total = state.books.length;
+    const done = decidedCount();
+    el.progress.innerHTML = '';
+    if (idx === -1) el.progress.append('全', textEl('b', '', String(total)), '冊チェック完了');
+    else el.progress.append(textEl('b', '', String(done + 1)), ` / ${total}冊目・残り${total - done}冊`);
     el.barFill.style.width = total ? `${(done / total) * 100}%` : '0';
     el.btnSave.disabled = idx === -1;
     el.btnSkip.disabled = idx === -1;
@@ -280,14 +296,20 @@
   // ------------------------------------------------------------ actions
   function decide(action, card) {
     if (state.busy) return;
-    const idx = currentIndex();
-    if (idx === -1) return;
-    const book = state.books[idx];
     card = card || el.deck.querySelector('.card.current');
+    // 画面に出ているカードの本に記録する（スワイプ中にほかの端末の記録を取り込んでも、動かした本に付ける）
+    const shown = card && state.books.find((b) => b.isbn === card.dataset.isbn);
+    const idx = currentIndex();
+    const book = shown || (idx === -1 ? null : state.books[idx]);
+    if (!book) return;
 
+    // 取り消しで元に戻せるよう、直前の判定と保存の中身を覚えておく（スワイプ中にほかの端末で判定された本もある）
+    const prevDecision = state.decisions[book.isbn];
+    const prevSaved = state.saved.find((s) => s.isbn === book.isbn) || null;
     state.decisions[book.isbn] = action;
     let addedToSaved = false;
-    if (action === 'save' && !state.saved.some((s) => s.isbn === book.isbn)) {
+    if (action === 'skip' && prevSaved) state.saved = state.saved.filter((s) => s.isbn !== book.isbn);
+    if (action === 'save' && !prevSaved) {
       state.saved.push({
         isbn: book.isbn, title: book.title, author: book.author, publisher: book.publisher,
         pubdate: book.pubdate, cover: book.cover, source: book.source, source_url: book.source_url,
@@ -295,7 +317,7 @@
       });
       addedToSaved = true;
     }
-    state.last = { isbn: book.isbn, action, addedToSaved };
+    state.last = { isbn: book.isbn, action, addedToSaved, prevDecision, prevSaved: action === 'skip' ? prevSaved : null };
     touch(book.isbn);
     changed();
     el.savedCount.textContent = String(state.saved.length);
@@ -327,17 +349,23 @@
 
   function undo() {
     if (state.busy || !state.last) return;
-    const { isbn, action, addedToSaved } = state.last;
-    delete state.decisions[isbn];
+    const { isbn, action, addedToSaved, prevDecision, prevSaved } = state.last;
+    if (prevDecision) state.decisions[isbn] = prevDecision;
+    else delete state.decisions[isbn];
     if (action === 'save' && addedToSaved) {
       state.saved = state.saved.filter((s) => s.isbn !== isbn);
+    }
+    if (prevSaved && !state.saved.some((s) => s.isbn === isbn)) {
+      // 保存日時の順で元の場所へ戻す（ほかの本の並びは動かさない）
+      const at = state.saved.findIndex((s) => String(s.savedAt || '') > String(prevSaved.savedAt || ''));
+      state.saved.splice(at === -1 ? state.saved.length : at, 0, prevSaved);
     }
     state.last = null; // 取り消しは直近1回分のみ
     touch(isbn);
     changed();
     const book = state.books.find((b) => b.isbn === isbn);
     toast(`取り消しました：${book ? book.title : isbn}`);
-    render('undo');
+    render(prevDecision ? undefined : 'undo'); // 元が判定済みなら、カードは戻さず今のカードのまま
     if (el.dialog.open) renderSaved();
   }
 
@@ -354,6 +382,7 @@
       if (e.pointerType === 'mouse' && e.button !== 0) return;
       if (e.target.closest('button, a')) return;
       d = { id: e.pointerId, x0: e.clientX, y0: e.clientY, dx: 0, dy: 0, t0: performance.now(), active: false };
+      state.dragging = true;
       try { card.setPointerCapture(e.pointerId); } catch (_) { /* noop */ }
     });
 
@@ -383,7 +412,8 @@
       if (!d || e.pointerId !== d.id) return;
       const { dx, active, t0 } = d;
       d = null;
-      if (!active) return;
+      state.dragging = false;
+      if (!active) { flushStaleDeck(0); return; }
       const v = Math.abs(dx) / Math.max(1, performance.now() - t0); // px/ms
       const commit = !cancelled && (Math.abs(dx) >= threshold() || (v > 0.7 && Math.abs(dx) > 50));
       if (commit) {
@@ -391,9 +421,11 @@
       } else {
         card.classList.remove('dragging');
         card.classList.add('settle');
+        state.animUntil = performance.now() + 250;
         card.style.transform = '';
         stampSave.style.opacity = '0';
         stampSkip.style.opacity = '0';
+        flushStaleDeck(260); // 元の位置に戻るアニメーション（.25s）の後で描き直す
       }
     };
     card.addEventListener('pointerup', (e) => end(e, false));
@@ -535,6 +567,10 @@
     error: null,
     lastOk: 0,
     lastPull: 0,
+    pollTimer: 0,       // 表示中の定期取り込み
+    calls: 0,           // GitHub へ問い合わせた回数（通信なしで終わった同期では定期取り込みを先送りしない）
+    failures: 0,        // 続けて失敗した回数（定期取り込みの間隔を延ばす）
+    quiet: false,       // 定期取り込みの実行中（状態表示を「同期中…」に切り替えない）
   };
 
   class SyncError extends Error {
@@ -609,10 +645,41 @@
     return true;
   }
   function onRemoteApplied() {
-    if (document.body.dataset.ready === '1' && !state.busy) render();
+    if (document.body.dataset.ready === '1') refreshDeck();
     else el.savedCount.textContent = String(state.saved.length);
     if (el.dialog.open) renderSaved();
     toast('ほかの端末の記録を反映しました');
+  }
+  // 取り込んだ記録を画面へ。めくりの最中は終わった後の描画に任せ、触れている間は指を離すまで待つ。
+  // 表示中のカードが変わらなければ作り直さず（読みかけの「続きを読む」もそのまま）、裏の次のカードと進み具合などだけ更新する。
+  function refreshDeck() {
+    if (state.busy) return;
+    const wait = state.animUntil - performance.now();
+    if (state.dragging || wait > 0) {
+      state.deckStale = true;
+      el.savedCount.textContent = String(state.saved.length);
+      if (!state.dragging) flushStaleDeck(wait + 20); // 動きが終わってから描き直す
+      return;
+    }
+    const idx = currentIndex();
+    const cur = el.deck.querySelector('.card.current');
+    if (idx === -1 || !cur || cur.dataset.isbn !== state.books[idx].isbn) { render(); return; }
+    state.deckStale = false;
+    const nxt = el.deck.querySelector('.card.next');
+    const nextIdx = nextIndexAfter(idx);
+    const nextIsbn = nextIdx === -1 ? null : state.books[nextIdx].isbn;
+    if ((nxt ? nxt.dataset.isbn : null) !== nextIsbn) {
+      if (nxt) nxt.remove();
+      if (nextIsbn) el.deck.insertBefore(buildCard(state.books[nextIdx], 'next'), cur);
+      preload(idx);
+    }
+    renderMeta(idx);
+  }
+  function flushStaleDeck(delay) {
+    if (!state.deckStale) return;
+    setTimeout(() => {
+      if (state.deckStale && !state.dragging && !state.busy) refreshDeck();
+    }, delay);
   }
 
   function b64encode(str) {
@@ -638,10 +705,22 @@
       'X-GitHub-Api-Version': '2022-11-28',
     };
     if (body) headers['Content-Type'] = 'application/json';
+    sync.calls++;
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), SYNC_TIMEOUT_MS) : 0;
+    let res = null;
     try {
-      return await fetch(url, { method, headers, cache: 'no-store', body: body ? JSON.stringify(body) : undefined });
+      res = await fetch(url, {
+        method, headers, cache: 'no-store', body: body ? JSON.stringify(body) : undefined, signal: ctrl ? ctrl.signal : undefined,
+      });
+      const data = res.ok ? await res.json() : null; // 本文の読み取りも待ち時間の上限内で
+      return { status: res.status, ok: res.ok, headers: res.headers, data };
     } catch (_) {
+      if (ctrl && ctrl.signal.aborted) throw new SyncError('GitHub から応答がありませんでした', 'network');
+      if (res) throw new SyncError('GitHub の応答を読めませんでした', 'http');
       throw new SyncError('通信できませんでした（オフラインかもしれません）', 'network');
+    } finally {
+      clearTimeout(timer);
     }
   }
   function httpError(res) {
@@ -655,6 +734,7 @@
   }
   async function pullRemote(cfg) {
     const res = await api(cfg, 'GET');
+    if (cfg !== sync.cfg) return {}; // 通信中に同期の設定が解除・変更された（結果は使わない）
     if (res.status === 404) {
       // ファイルが無い（またはリポジトリに届かない）。書き込みの応答で判定する
       sync.sha = null;
@@ -662,7 +742,7 @@
       return {};
     }
     if (!res.ok) throw httpError(res);
-    const meta = await res.json();
+    const meta = res.data || {};
     const recs = {};
     try {
       const data = JSON.parse(b64decode(meta.content || ''));
@@ -686,9 +766,10 @@
     const body = { message: 'update records', content: b64encode(text + '\n') };
     if (sync.sha) body.sha = sync.sha;
     const res = await api(cfg, 'PUT', body);
+    if (cfg !== sync.cfg) return true; // 通信中に同期の設定が解除・変更された
     if (res.status === 409 || res.status === 422) return false;
     if (!res.ok) throw httpError(res);
-    const out = await res.json();
+    const out = res.data || {};
     sync.sha = (out.content && out.content.sha) || null;
     sync.remoteCanon = canon(recs);
     return true;
@@ -696,8 +777,10 @@
   async function syncOnce(cfg, mode) {
     for (let attempt = 0; attempt < 4; attempt++) {
       if (attempt > 0) await sleep(500 * attempt);
+      if (cfg !== sync.cfg) return; // 同期の設定が解除・変更された：古い設定では続けない
       if (mode === 'pull' || attempt > 0 || sync.remoteCanon === null) {
         const remote = await pullRemote(cfg);
+        if (cfg !== sync.cfg) return;
         if (mode === 'pull') sync.lastPull = Date.now();
         if (applyRecords(mergeRecords(localRecords(), remote))) onRemoteApplied();
       }
@@ -709,15 +792,22 @@
     throw new SyncError('ほかの端末の書き込みと重なり、書き込めませんでした。少しあとで「今すぐ同期」を押してください', 'conflict');
   }
 
-  function requestSync(mode) {
+  // quiet: 定期取り込み。状態表示は切り替えず、結果（反映・エラー）だけ出す
+  function requestSync(mode, quiet) {
     if (!sync.cfg) return;
     if (mode === 'pull' || !sync.want) sync.want = mode;
+    if (!quiet) sync.quiet = false;
     clearTimeout(sync.timer);
     sync.timer = 0;
-    if (!sync.running) runSync();
-    else renderSyncStatus();
+    if (!sync.running) {
+      sync.quiet = !!quiet;
+      runSync();
+    } else {
+      renderSyncStatus();
+    }
   }
   async function runSync() {
+    const calls0 = sync.calls;
     sync.running = true;
     renderSyncStatus();
     while (sync.want && sync.cfg) {
@@ -726,15 +816,36 @@
       sync.want = null;
       try {
         await syncOnce(cfg, mode);
+        if (cfg !== sync.cfg) continue; // 途中で設定が変わった：結果は新しい設定の同期に任せる
         sync.error = null;
         sync.lastOk = Date.now();
+        sync.failures = 0;
       } catch (err) {
+        if (cfg !== sync.cfg) continue; // 古い設定での失敗は数えない（新しい設定の取り込みを止めない）
         sync.error = err instanceof SyncError ? err : new SyncError(`同期できませんでした（${err && err.message}）`, 'unknown');
-        break; // 記録はローカルに残っている。次の変更・画面の再表示・「今すぐ同期」で再試行
+        sync.failures++;
+        break; // 記録はローカルに残っている。次の変更・画面の再表示・回線の復帰・定期取り込み・「今すぐ同期」で再試行
       }
     }
     sync.running = false;
+    sync.quiet = false;
     renderSyncStatus();
+    // GitHub と通信した時だけ次の取り込みを30秒後に置き直す（書き込み済み＝その時点のリモートを確認済み）
+    if (sync.calls !== calls0 || !sync.pollTimer) schedulePoll();
+  }
+  // 画面の表示中だけ、最後の同期から30秒ごとにほかの端末の変更を取り込む（失敗が続けば 60→120→240→300秒と延ばす）
+  function schedulePoll() {
+    clearTimeout(sync.pollTimer);
+    sync.pollTimer = 0;
+    if (!sync.cfg || document.visibilityState !== 'visible') return;
+    const delay = Math.min(SYNC_POLL_MS * 2 ** sync.failures, SYNC_POLL_MAX_MS);
+    sync.pollTimer = setTimeout(() => {
+      sync.pollTimer = 0;
+      // 書き込み待ち（2秒のまとめ）の間は前倒ししない。その書き込みが終われば次の取り込みを置き直す
+      // （ほかの端末が先に書いていれば、書き込みが SHA 不一致になって取り込みと再マージが走る）
+      if (sync.timer) return;
+      if (sync.cfg && document.visibilityState === 'visible') requestSync('pull', true);
+    }, delay);
   }
   function scheduleSync() {
     if (!sync.cfg) return;
@@ -764,6 +875,9 @@
     sync.want = null;
     clearTimeout(sync.timer);
     sync.timer = 0;
+    clearTimeout(sync.pollTimer);
+    sync.pollTimer = 0;
+    sync.failures = 0;
   }
   function normalizeRepo(v) {
     const r = String(v || '').trim()
@@ -778,9 +892,11 @@
     const d = new Date(ms);
     return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
   }
+  // 表示上の「同期中」：定期取り込みの実行中は含めない（30秒ごとに表示が切り替わらないように）
+  function syncBusy() { return (sync.running && !sync.quiet) || !!sync.timer; }
   function syncStatusText() {
     if (!sync.cfg) return '';
-    if (sync.running) return '同期中…';
+    if (sync.running && !sync.quiet) return '同期中…';
     if (sync.timer) return '同期待ち…';
     if (sync.error) return `同期できませんでした：${sync.error.message}。記録はこの端末に残っています`;
     if (sync.lastOk) return `同期済み ${fmtClock(sync.lastOk)}`;
@@ -788,8 +904,8 @@
   }
   function renderSyncStatus() {
     const on = !!sync.cfg;
-    const isErr = on && !sync.running && !sync.timer && !!sync.error;
-    el.btnSync.dataset.state = !on ? 'off' : (sync.running || sync.timer) ? 'busy' : isErr ? 'error' : sync.lastOk ? 'ok' : 'busy';
+    const isErr = on && !syncBusy() && !!sync.error;
+    el.btnSync.dataset.state = !on ? 'off' : syncBusy() ? 'busy' : isErr ? 'error' : sync.lastOk ? 'ok' : 'busy';
     el.btnSync.setAttribute('aria-label', on ? `端末間の同期：${syncStatusText()}` : '端末間の同期：未設定');
     el.syncLine.hidden = !on;
     el.syncLine.textContent = syncStatusText();
@@ -805,7 +921,7 @@
     } else {
       el.syncState.append(`設定済み：${cfg.repo}（トークン末尾 …${cfg.token.slice(-4)}）`, document.createElement('br'), syncStatusText());
     }
-    el.syncState.classList.toggle('is-error', !!cfg && !sync.running && !sync.timer && !!sync.error);
+    el.syncState.classList.toggle('is-error', !!cfg && !syncBusy() && !!sync.error);
     el.syncOnActions.hidden = !cfg;
     el.syncForm.hidden = !!cfg && !syncUi.editing;
     el.btnShowQr.disabled = !cfg;
@@ -997,13 +1113,17 @@
   el.btnScan.addEventListener('click', startScan);
   el.btnScanStop.addEventListener('click', stopScan);
 
-  // 画面に戻った時に取り直す／離れる時は待たずに書き込む／回線が戻ったら再試行
+  // 画面に戻った時に取り直す／離れる時は待たずに書き込む（定期取り込みは止める）／回線が戻ったら再試行
   document.addEventListener('visibilitychange', () => {
     if (!sync.cfg) return;
     if (document.visibilityState === 'hidden') {
+      clearTimeout(sync.pollTimer);
+      sync.pollTimer = 0;
       if (sync.timer) requestSync('push');
     } else if (Date.now() - sync.lastPull > 5000) {
       requestSync('pull');
+    } else if (!sync.running) {
+      schedulePoll();
     }
   });
   window.addEventListener('online', () => requestSync('pull'));
